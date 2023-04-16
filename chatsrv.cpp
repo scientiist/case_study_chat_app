@@ -1,6 +1,14 @@
 // Compile the server with the following:
 // g++ -o chatsrv chatsrv.cpp -lpthread
 
+// The basic architecture of the server is that it will spawn a thread for each client that connects.
+// It will have a global list of the connected clients, and each thread will relay server messages to that list.
+// The list will be protected from simultaneous modifications by means of a mutex.
+// The main loop for eeach thread will first check to see if the client has sent a command
+// If it has, it is dealt with and a return code is sent.
+// Then the thread checks to see if there are any pending messages to be sent to the server.
+// This loop continues until the coient disconnects or the user has been kicked out of the room.
+
 #include <iostream>
 #include <string>
 #include <map>
@@ -18,6 +26,11 @@
 #define LISTEN_PORT 5296
 #define MAX_LINE_BUFF 1024
 
+// Here we define two structures
+// The first will help us keep track of each connected client
+// We have two flags: one to signify whether the user is a room operator,
+// and the other to signify that the user was kicked out of the room.
+// Finally, we have a vector of strings. This will contain a list of messages that are being relayed to the client
 
 struct client_t {
     bool opstatus;
@@ -25,6 +38,9 @@ struct client_t {
     std::vector<std::string> outbound;
 };
 
+// The second structure is for holding the client commands.
+// We will parse the command into this structure for easier handling.
+// The maximum number of operands for any command is two.
 struct cmd_t
 {
     std::string command;
@@ -32,6 +48,8 @@ struct cmd_t
     std::string op2;
 };
 
+// Globals
+// Mutex to synchronize access to the room topic
 pthread_mutex_t  room_topic_mutex;
 std::string room_topic;
 pthread_mutex_t client_list_mutex;
