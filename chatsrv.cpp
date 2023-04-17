@@ -9,6 +9,19 @@
 // Then the thread checks to see if there are any pending messages to be sent to the server.
 // This loop continues until the coient disconnects or the user has been kicked out of the room.
 
+// You can demo the server behavior by running the executable
+// and using netcat to connect and issue commands.
+
+// netcat 127.0.0.1 5296
+
+// JOIN <username>
+// MSG <message>
+// PMSG <target> <message>
+// OP <target>
+// TOPIC <new_room_topic>
+// KICK <target>
+// QUIT
+
 #include <iostream>
 #include <string>
 #include <map>
@@ -65,7 +78,7 @@ int pmsg_command(const cmd_t &cmd, const std::string &nickname, std::string &msg
 int op_command(const cmd_t &cmd, const std::string &nickname, std::string &msg);
 int kick_command(const cmd_t &cmd, const std::string &nickname, std::string &msg);
 int topic_command(const cmd_t &cmd, const std::string &nickname, std::string &msg);
-int quit_command(const std::string &nickname, std::string msg);
+int quit_command(const std::string &nickname, std::string &msg);
 
 int main(int argc, char *argv[])
 {
@@ -76,9 +89,13 @@ int main(int argc, char *argv[])
     pthread_t thread_id;
     int flag = 1;
 
+	// Create our listening socket
+	// Set the socket option SO_REUSEADDR
+	// This will keep us from getting "address in use" errors when stopping & starting the server
     listensock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     setsockopt(listensock, IPPROTO_TCP, SO_REUSEADDR, (char* ) &flag, sizeof(int));
 
+	// Bind our socket to all avaliable addresses & our port
     sAddr.sin_family  = AF_INET;
     sAddr.sin_port = htons(LISTEN_PORT);
     sAddr.sin_addr.s_addr = INADDR_ANY;
@@ -88,15 +105,21 @@ int main(int argc, char *argv[])
         perror("chatsrv");
         return 0;
     }
+
+	// Set the socket to listen
     result = listen(listensock, 5);
     if (result < 0) {
         perror("chatsrv");
         return 0;
     }
 
+	// If everything has suceeded so far, we go ahead and initialize our mutexes.
+	// This must be done only once and before **any** of the threads use them.
+
     pthread_mutex_init(&room_topic_mutex, NULL);
     pthread_mutex_init(&client_list_mutex, NULL);
 
+	// Main Loop: We accept incoming connections and start a new thread for each client.
     while (1)
     {
         newsock = accept(listensock, NULL, NULL);
@@ -112,6 +135,7 @@ int main(int argc, char *argv[])
     return 1;
 }
 
+// Here defines our thread procedure
 void* thread_proc(void *arg)
 {
     int sock;
@@ -130,6 +154,8 @@ void* thread_proc(void *arg)
     // Retrieve socket passed to thread_proc
     sock = (int64_t) arg;
     // Turn off Nagle's algorithm
+	// It attempts to group undersized outgoing packets in order to send them out at once
+	// This is enabled by default in linux.
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int));
     // Set socket to nonblocking
     ioctl(sock, FIONBIO, (char *) &flag);
@@ -148,11 +174,12 @@ void* thread_proc(void *arg)
             return arg;
         } else if (status > 0) {
             cmd = decodeCommand(buffer);
-
+			// If client issues command without joining the room.
             if (!joined && cmd.command != "JOIN") {
                 return_msg = "203 DENIED - MUST JOIN FIRST";
             } else {
                 if (cmd.command == "JOIN") {
+					// Don't let them join twice
                     if (joined) {
                         return_msg = "203 DENIED - ALREADY JOINED";
                     } else {
@@ -209,6 +236,9 @@ void* thread_proc(void *arg)
     return arg;
 }
 
+
+// Commands from the client are terminated with a newline character.
+// The function will read up to a newline and then return.
 int readLine(int sock, char *buffer, int buffsize)
 {
     char *buffPos;
@@ -222,6 +252,7 @@ int readLine(int sock, char *buffer, int buffsize)
     int readSize;
     unsigned long blockMode;
 
+	// Is there anything to read?
     FD_ZERO(&fset);
     FD_SET(sock, &fset);
     tv.tv_sec = 0;
@@ -230,18 +261,25 @@ int readLine(int sock, char *buffer, int buffsize)
     if (sockStatus <= 0) {
         return sockStatus;
     }
+
+	// Initialize buffer and set pointers for buffPos, and buffEnd
     buffer[0] = '\0';
     buffPos = buffer;
     buffEnd = buffer+buffsize;
     readlen = 0;
 
+	// Reads in data in a loop.
     while (!complete) {
+		// Make sure we have buffer room first
         if ((buffEnd-buffPos) < 0) {
             readSize = 0;
         } else {
             readSize = 1;
         }
 
+		// Now we call select() to make sure there is something to read.
+		// This also allows us to escape if the client suddenly disconnects or if the client is sending data too slowly.
+		// We set a timeout of 5 secs for getting data from the client.
         FD_ZERO(&fset);
         FD_SET(sock, &fset);
         tv.tv_sec = 5;
@@ -249,6 +287,8 @@ int readLine(int sock, char *buffer, int buffsize)
         sockStatus = select(sock + 1, &fset, NULL, &fset,&tv);
         if (sockStatus < 0) {return -1;}
 
+		// Recieve character and check if it's a newline.
+		// If so, we are done.
         nChars = recv(sock, (char *) buffPos, readSize, MSG_NOSIGNAL);
         readlen += nChars;
         if (nChars <= 0) {
@@ -258,15 +298,22 @@ int readLine(int sock, char *buffer, int buffsize)
             complete = true;
             buffPos[nChars - 1] = '\0';
         }
+		// Otherwise, we can add it to the buffer and loop.
         buffPos += nChars;
-
-
     }
+	// returns the size of the string we need.
     return readlen;
 }
 
 
+// Decodes a string received from the client into our cmd_t structure.
+// It basically separates the buffer based on the space being the delimiter.
+// Since we can have at most two operands for a command, after it finds the second space it places the remaining text from the buffer into second op.
+// This works perfectly for our commands such as PMSG, where the second operand can contain spaces.
+// It works well enough for the MSG command, which has only one operand.
+// If the message contains spaces we just concatenate the two operands, in the msg_command() func.
 
+// NOTE: This is just how I copied from the book, we should definitely do variadic args later
 cmd_t decodeCommand(const char *buffer)
 {
     struct cmd_t ret_cmd;
@@ -288,19 +335,30 @@ cmd_t decodeCommand(const char *buffer)
     return ret_cmd;
 }
 
+// This function handles the JOIN command and, if successful, adds the user to the client_list map.
 int join_command(const cmd_t &cmd, std::string &msg)
 {
     int retval;
     std::map<std::string, client_t>::iterator client_iter;
 
+	// Preliminary check on the nickname.
+	// If the nickname has a space in it, then it'll have been separated into op1 and op2.
+	// Therefore, if op2 is not an empty strin, then the nickname is invalid.
     if(cmd.op1.length()==0 || cmd.op2.length() > 0)
     {
         msg = "201 INVALID NICKNAME";
         return 0;
     } else {
+		// Next, we check to make sure that a room member isn't already using the nickname.
+		// Before checking the client_list map, we must lock the mutex.
         pthread_mutex_lock(&client_list_mutex);
         client_iter = client_list.find(cmd.op1);
 
+		// If the nickname isn't already in use, we add the client to the room.
+		// First, we check to see if this is the first user in the room.
+		// If so, then that user automatically becomes a room operator.
+		// Notice that we're implicitly adding the user to the room
+		// by taking advantage of the fact that an STL map will create a new entry for us if one doesn't exist.
         if (client_iter == client_list.end()) {
             if (client_list.size() == 0) {
                 client_list[cmd.op1].opstatus = true;
@@ -308,6 +366,14 @@ int join_command(const cmd_t &cmd, std::string &msg)
                 client_list[cmd.op1].opstatus = false;
             }
             client_list[cmd.op1].kickflag = false;
+
+			// Now, we cycle through the other users in the room, if there are any.
+			// We do three things here:
+			// First, we tell the others that a new user has joined the room.
+			// Second, we gather the names of the users already in the room to relay to the new user.
+			// Third, we tell the new user which existing users are room operators.
+			// Notice that the server commands are added to the clients' outbound message queue.
+			// They will then be sent to the client in the main loop.
 
             for (client_iter = client_list.begin();
                 client_iter != client_list.end(); ++client_iter) {
@@ -324,12 +390,13 @@ int join_command(const cmd_t &cmd, std::string &msg)
                 }
             }
 
-            // Tell the new client the room topic
+            // Tell the new client the room topic, then return a success code
             pthread_mutex_lock(&room_topic_mutex);
             client_list[cmd.op1].outbound.push_back("TOPIC * "+room_topic);
             pthread_mutex_unlock(&room_topic_mutex);
             msg = "100 OK";
             retval = 1;
+		// If the nickname is in use, then we send a failure notice.
         } else {
             msg = "200 NICKNAME IN USE";
             retval = 0;
@@ -339,7 +406,9 @@ int join_command(const cmd_t &cmd, std::string &msg)
     return retval;
 }
 
-
+// Next, we handle the MSG command
+// This is a simple function, as all it does is relay
+// the message to all connected clients by adding it to their outbound queues
 int msg_command(const cmd_t &cmd, const std::string &nickname, std::string &msg)
 {
     std::map<std::string, client_t>::iterator client_iter;
@@ -354,12 +423,16 @@ int msg_command(const cmd_t &cmd, const std::string &nickname, std::string &msg)
     return 1;
 }
 
+// Handling a private message is almost as easy
+// First we make sure the recipient exists
+// if so, add the message to their outbound queue.
 int pmsg_command(const cmd_t &cmd, const std::string &nickname, std::string &msg)
 {
     std::map<std::string, client_t>::iterator client_iter;
 
     pthread_mutex_lock(&client_list_mutex);
     client_iter = client_list.find(cmd.op1);
+
     if (client_iter == client_list.end()) {
         msg = "202 UNKNOWN NICKNAME";
     } else {
@@ -376,17 +449,23 @@ int op_command(const cmd_t &cmd, const std::string &nickname, std::string &msg)
 
     pthread_mutex_lock(&client_list_mutex);
     client_iter = client_list.find(nickname);
-
+	// We get the first client list entry for the user issuing the OP command.
+	// If we can't find that entry, then something is wrong.
     if (client_iter == client_list.end()) {
         msg = "999 UNKNOWN";
     } else {
+		// Next we verify that the caller is a room operator.
         if ((*client_iter).second.opstatus == false) {
             msg = "203 DENIED";
         } else {
+			// If the verification succeeds, we then check to make sure
+			// that the target of the OP command is valid.
             client_iter = client_list.find(cmd.op1);
             if (client_iter == client_list.end()) {
                 msg = "202 UNKNOWN NICKNAME";
             } else {
+				// Finally, we set the operator status flag on the recipient
+				// and notify the room members of the new room operator.
                 (*client_iter).second.opstatus = true;
                 for (client_iter = client_list.begin();
                     client_iter != client_list.end(); client_iter++) {
@@ -400,21 +479,31 @@ int op_command(const cmd_t &cmd, const std::string &nickname, std::string &msg)
     return 1;
 }
 
+// The KICK command causes a user to be forcibly removed from the room.
 int kick_command(const cmd_t &cmd, const std::string &nickname, std::string &msg)
 {
     std::map<std::string, client_t>::iterator client_iter;
+	// We first get the client list entry for the user issuing the command.
+	// If we can't find that entry, then something is wrong.
     pthread_mutex_lock(&client_list_mutex);
     client_iter = client_list.find(nickname);
     if (client_iter == client_list.end()) {
         msg = "999 UNKNOWN";
     } else {
+		// Next, we verify that the caller is a room operator.
         if ((*client_iter).second.opstatus == false) {
             msg = "203 DENIED";
         } else {
+			// Then, we validate the target of the KICK command
+
             client_iter = client_list.find(cmd.op1);
             if (client_iter == client_list.end()) {
                 msg = "202 UNKNOWN NICKNAME";
             } else {
+				// Finally, we set the kick flag on the user being removed,
+				// and notify everyone in the room about what happened
+				// the kick flag will be picked up in the main loop
+				// and the client will be disconnected
                 (*client_iter).second.kickflag = true;
                 for (client_iter = client_list.begin();
                     client_iter != client_list.end(); client_iter++) {
@@ -428,6 +517,9 @@ int kick_command(const cmd_t &cmd, const std::string &nickname, std::string &msg
     return 1;
 }
 
+// This function handles the TOPIC command
+// Room operators have the ability to set a topic for the room.
+// It is very similar to the other "operator-only" commands.
 int topic_command(const cmd_t &cmd, const std::string &nickname, std::string &msg) {
     std::map<std::string, client_t>::iterator client_iter;
 
@@ -456,6 +548,8 @@ int topic_command(const cmd_t &cmd, const std::string &nickname, std::string &ms
     return 1;
 }
 
+// This function handles the QUIT command
+// We remove the client from the client_list map and notify the others that the client has left.
 int quit_command(const std::string &nickname, std::string &msg)
 {
     std::map<std::string, client_t>::iterator client_iter;
